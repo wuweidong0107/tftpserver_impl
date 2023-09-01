@@ -91,6 +91,35 @@ static ssize_t tftp_recv_message(int s, tftp_message* m, struct sockaddr_in* soc
     return c;
 }
 
+ssize_t tftp_send_ack(int s, uint16_t block_number, struct sockaddr_in *sock, socklen_t slen)
+{
+    tftp_message m;
+    ssize_t c;
+    m.opcode = htons(ACK);
+    m.ack.block_number = htons(block_number);
+
+    if ((c = sendto(s, &m, sizeof(m.ack), 0, 
+            (struct sockaddr*)sock, slen)) < 0) {
+        perror("server: sendto()");
+    }
+    return c;
+}
+
+ssize_t tftp_send_data(int s, uint16_t block_number, uint8_t *data, 
+                ssize_t dlen, struct sockaddr_in *sock, socklen_t slen)
+{
+    tftp_message m;
+    ssize_t c;
+
+    m.opcode = htons(DATA);
+    m.data.block_number = htons(block_number);
+    memcpy(m.data.data, data, dlen);
+    if ((c = sendto(s, &m, 4 + dlen, 0, (struct sockaddr *)sock, slen)) < 0) {
+        perror("server: sendto()");
+    }
+    return c;
+}
+
 static void tftp_handle_request(tftp_message* m, ssize_t len,
                 struct sockaddr_in* client_sock, socklen_t slen)
 {
@@ -135,8 +164,96 @@ static void tftp_handle_request(tftp_message* m, ssize_t len,
     }
 
     opcode = ntohs(m->opcode);
-    printf("file: %s\n", filename);
-    printf("mode: %s\n", mode_s);
+
+    fd = fopen(filename, opcode == RRQ ? "r":"w");
+    if (fd == NULL) {
+        perror("servre: fopen()");
+        tftp_send_error(s, errno, strerror(errno), client_sock, slen);
+        exit(1);
+    }
+
+    printf("%s.%u: request received: %s %s %s\n", 
+        inet_ntoa(client_sock->sin_addr), ntohs(client_sock->sin_port),
+        ntohs(m->opcode) == RRQ ? "get" : "put", filename, mode_s);
+
+    if (opcode == RRQ) {
+        tftp_message m;
+        int to_close = 0;
+        ssize_t dlen,c ;
+        uint8_t data[512];
+        uint16_t block_number = 0;
+        int countdown;
+
+        while(!to_close) {
+            dlen = fread(data, 1, sizeof(data), fd);
+            block_number++;
+            if (dlen < 512) {
+                to_close = 1;
+            }
+
+            for (countdown = RECV_RETRIES; countdown; countdown--) {
+                c = tftp_send_data(s, block_number, data, dlen, client_sock, slen);
+                if (c < 0) {
+                        printf("%s.%u: transfer killed\n",
+                            inet_ntoa(client_sock->sin_addr), ntohs(client_sock->sin_port));
+                        exit(1);
+                }
+
+                c = tftp_recv_message(s, &m, client_sock, &slen);
+                if (c >= 0 && c < 4) {
+                    printf("%s.%u: message with invalid size received\n",
+                        inet_ntoa(client_sock->sin_addr), ntohs(client_sock->sin_port));
+                    tftp_send_error(s, 0, "invalid request size", client_sock, slen);
+                    exit(1);
+                }
+
+                if (c >= 4)
+                    break;
+
+                if (errno != EAGAIN) {
+                    printf("%s.%u: transfer killed\n",
+                        inet_ntoa(client_sock->sin_addr), ntohs(client_sock->sin_port));
+                    exit(1);
+                }
+            }
+
+            if (!countdown) {
+                    printf("%s.%u: transfer timed out\n",
+                        inet_ntoa(client_sock->sin_addr), ntohs(client_sock->sin_port));
+                    exit(1);
+            }
+
+            if (ntohs(m.opcode) == ERROR)  {
+                    printf("%s.%u: error message received: %u %s\n",
+                        inet_ntoa(client_sock->sin_addr), ntohs(client_sock->sin_port),
+                        ntohs(m.error.error_code), m.error.error_string);
+                    exit(1);
+            }
+
+            if (ntohs(m.opcode) != ACK)  {
+                    printf("%s.%u: invalid message during transfer received\n",
+                        inet_ntoa(client_sock->sin_addr), ntohs(client_sock->sin_port));
+                    tftp_send_error(s, 0, "invalid message during transfer", client_sock, slen);
+                    exit(1);
+            }
+            
+            if (ntohs(m.ack.block_number) != block_number) { // the ack number is too high
+                    printf("%s.%u: invalid ack number received\n", 
+                        inet_ntoa(client_sock->sin_addr), ntohs(client_sock->sin_port));
+                    tftp_send_error(s, 0, "invalid ack number", client_sock, slen);
+                    exit(1);
+            }
+        }
+    } else if (opcode == WRQ) {
+
+    }
+    printf("%s.%u: transfer completed\n",
+        inet_ntoa(client_sock->sin_addr), ntohs(client_sock->sin_port));
+    
+    fclose(fd);
+    close(s);
+
+    exit(0);
 }
 
 static void cld_handler(int sig)
@@ -160,10 +277,7 @@ int main(int argc, char* argv[])
     base_directory = argv[1];
 
     if (argc > 2) {
-        if (sscanf(argv[2], "%hu", &port)) {
-            printf("xxxx: %d\n", port);
-            printf("yyyy: %d\n", port);
-        } else {
+        if (!sscanf(argv[2], "%hu", &port)) {
             fprintf(stderr, "error: invalid port\n");
             exit(1);
         }
