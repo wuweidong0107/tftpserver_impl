@@ -11,6 +11,12 @@
 #include <signal.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+
+#define RECV_TIMEOUT 5
+#define RECV_RETRIES 5
 
 enum opcode {
     RRQ=1,
@@ -85,9 +91,59 @@ static ssize_t tftp_recv_message(int s, tftp_message* m, struct sockaddr_in* soc
     return c;
 }
 
-static void tftp_handle_request()
+static void tftp_handle_request(tftp_message* m, ssize_t len,
+                struct sockaddr_in* client_sock, socklen_t slen)
 {
+    int s;
+    struct timeval tv;
+    char *filename, *end, *mode_s;
+    uint16_t opcode;
+    FILE *fd;
+
     printf("tftp_handle_request\n");
+
+    /* open new socket, to handle client request */
+    if ((s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
+        perror("server: socket()");
+        exit(1);
+    }
+
+    tv.tv_sec = RECV_TIMEOUT;
+    tv.tv_usec = 0;
+    if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        perror("server: setsockopt()");
+        exit(1);
+    }
+
+    /* parse client request */
+    filename = (char *)m->request.filename_and_mode;
+    end = &filename[len - 2 - 1];
+
+    if (*end != '\0') {
+        printf("%s.%u: invalid filename or mode\n",
+            inet_ntoa(client_sock->sin_addr), ntohs(client_sock->sin_port));
+        tftp_send_error(s, 0, "invalid filename or mode", client_sock, slen);
+        exit(1);
+    }
+
+    mode_s = strchr(filename, '\0') + 1;
+
+    if (mode_s > end) {
+        printf("%s.%u: transfer mode not specified\n", 
+            inet_ntoa(client_sock->sin_addr), ntohs(client_sock->sin_port));
+        tftp_send_error(s, 0, "transfer mode not specified", client_sock, slen);
+    }
+
+    opcode = ntohs(m->opcode);
+    printf("file: %s\n", filename);
+    printf("mode: %s\n", mode_s);
+}
+
+static void cld_handler(int sig)
+{
+    int status;
+    wait(&status);
+    printf("got child exit signal\n");
 }
 
 int main(int argc, char* argv[])
@@ -105,7 +161,8 @@ int main(int argc, char* argv[])
 
     if (argc > 2) {
         if (sscanf(argv[2], "%hu", &port)) {
-            port = htons(port);
+            printf("xxxx: %d\n", port);
+            printf("yyyy: %d\n", port);
         } else {
             fprintf(stderr, "error: invalid port\n");
             exit(1);
@@ -130,8 +187,8 @@ int main(int argc, char* argv[])
         exit(1);
     }
 
+    signal(SIGCLD, (void *)cld_handler);
     printf("tftp server: listening on %d\n", ntohs(server_sock.sin_port));
-
     while(1) {
         struct sockaddr_in client_sock;
         socklen_t slen = sizeof(client_sock);
@@ -154,7 +211,7 @@ int main(int argc, char* argv[])
         opcode = ntohs(message.opcode);
         if (opcode == RRQ || opcode == WRQ) {
             if (fork() == 0) {
-                tftp_handle_request();
+                tftp_handle_request(&message, len, &client_sock, slen);
                 exit(0);
             }
         } else {
