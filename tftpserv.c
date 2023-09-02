@@ -245,6 +245,88 @@ static void tftp_handle_request(tftp_message* m, ssize_t len,
             }
         }
     } else if (opcode == WRQ) {
+        tftp_message m;
+        ssize_t c;
+        uint16_t block_number = 0;
+        int to_close = 0;
+        int countdown;
+
+        c = tftp_send_ack(s, block_number, client_sock, slen);
+        if (c < 0) {
+            printf("%s.%u: transfer killed\n",
+                inet_ntoa(client_sock->sin_addr), ntohs(client_sock->sin_port));
+            exit(1);
+        }
+        while(!to_close) {
+            for (countdown = RECV_RETRIES; countdown; countdown--) {
+                c = tftp_recv_message(s, &m, client_sock, &slen);
+                if (c>=0 && c<4) {
+                    printf("%s.%u: message with invalid size received\n",
+                        inet_ntoa(client_sock->sin_addr), ntohs(client_sock->sin_port));
+                }
+
+                if (c>=4)
+                    break;
+                
+                if (errno!=EAGAIN) {
+                    printf("%s.%u: transfer killed\n",
+                        inet_ntoa(client_sock->sin_addr), ntohs(client_sock->sin_port));
+                    exit(1);
+                }
+
+                if (c<0) {
+                    printf("%s.%u: transfer killed\n",
+                        inet_ntoa(client_sock->sin_addr), ntohs(client_sock->sin_port));
+                    exit(1);
+                }
+            }
+
+            if (!countdown) {
+                printf("%s.%d: transfer time out\n",
+                    inet_ntoa(client_sock->sin_addr), ntohs(client_sock->sin_port));
+                exit(1);
+            }
+
+            block_number++;
+
+            if (c < sizeof(m.data)) {
+                to_close = 1;
+            }
+
+            if (ntohs(m.opcode) == ERROR)  {
+                printf("%s.%u: error message received: %u %s\n",
+                    inet_ntoa(client_sock->sin_addr), ntohs(client_sock->sin_port),
+                    ntohs(m.error.error_code), m.error.error_string);
+                exit(1);
+            }
+
+            if (ntohs(m.opcode) != DATA)  {
+                printf("%s.%u: invalid message during transfer received\n",
+                    inet_ntoa(client_sock->sin_addr), ntohs(client_sock->sin_port));
+                tftp_send_error(s, 0, "invalid message during transfer", client_sock, slen);
+                exit(1);
+            }
+            
+            if (ntohs(m.data.block_number) != block_number) {
+                printf("%s.%u: invalid block number received\n", 
+                        inet_ntoa(client_sock->sin_addr), ntohs(client_sock->sin_port));
+                tftp_send_error(s, 0, "invalid block number", client_sock, slen);
+                exit(1);
+            }
+
+            c = fwrite(m.data.data, 1, c-4, fd);
+            if (c<0) {
+                perror("server: fwrite()");
+                exit(1);
+            }
+
+            c = tftp_send_ack(s, block_number, client_sock, slen);
+            if (c < 0) {
+                printf("%s.%u: transfer killed\n",
+                        inet_ntoa(client_sock->sin_addr), ntohs(client_sock->sin_port));
+                exit(1);
+            }
+        }
 
     }
     printf("%s.%u: transfer completed\n",
